@@ -1,0 +1,15 @@
+# 凭据文件
+*.json
+
+# 日志文件
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# IDE
+.deepvcode/
+.vscode/
+.idea/
