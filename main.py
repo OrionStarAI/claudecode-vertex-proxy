@@ -171,26 +171,43 @@ class GCPProxyServer:
                     log_entries.append(f"system：{system_preview}")
 
             # 如果有响应，添加assistant的响应内容
-            if claude_response and 'content' in claude_response:
-                simple_logger.info("<<<<<<<<<<<")  # 分割线分隔不同的请求
-                response_content = claude_response['content']
-                if isinstance(response_content, list):
-                    # 处理结构化响应内容
-                    text_parts = []
-                    for part in response_content:
-                        if isinstance(part, dict) and part.get('type') == 'text':
-                            text_parts.append(part.get('text', ''))
-                    response_text = ''.join(text_parts)
-                elif isinstance(response_content, str):
-                    response_text = response_content
-                else:
-                    response_text = str(response_content)
+            if claude_response:
+                if 'content' in claude_response:
+                    response_content = claude_response['content']
+                    if isinstance(response_content, list):
+                        # 处理结构化响应内容
+                        text_parts = []
+                        for part in response_content:
+                            if isinstance(part, dict) and part.get('type') == 'text':
+                                text_parts.append(part.get('text', ''))
+                        response_text = ''.join(text_parts)
+                    elif isinstance(response_content, str):
+                        response_text = response_content
+                    else:
+                        response_text = str(response_content)
 
-                if response_text:
-                    # 移除换行符并只保留前200个字符
-                    cleaned_response = response_text.replace('\n', ' ').replace('\r', ' ')
-                    truncated_response = cleaned_response[:200]
-                    log_entries.append(f"assistant：{truncated_response}")
+                    if response_text:
+                        # 移除换行符并只保留前200个字符
+                        cleaned_response = response_text.replace('\n', ' ').replace('\r', ' ')
+                        truncated_response = cleaned_response[:200]
+                        log_entries.append(f"assistant：{truncated_response}")
+
+                # 添加 usage 信息
+                if 'usage' in claude_response:
+                    usage = claude_response['usage']
+                    # 参考其他项目的逻辑：输入 Token = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+                    cache_read = usage.get('cache_read_input_tokens', 0)
+                    cache_create = usage.get('cache_creation_input_tokens', 0)
+                    input_tokens = usage.get('input_tokens', 0) + cache_read + cache_create
+                    output_tokens = usage.get('output_tokens', 0)
+
+                    usage_str = f"usage：input={input_tokens}"
+                    if cache_read:
+                        usage_str += f"(cache_read={cache_read})"
+                    if cache_create:
+                        usage_str += f"(cache_create={cache_create})"
+                    usage_str += f", output={output_tokens}, total={input_tokens + output_tokens}"
+                    log_entries.append(usage_str)
 
             # 记录到精简日志文件
             if log_entries:
@@ -421,20 +438,23 @@ class GCPProxyServer:
             requested_model = claude_request.get('model', 'claude-3-sonnet-20240229')
             vertex_model_name = self.get_vertex_model_name(requested_model)
 
+            # 检查是否是流式请求
+            is_streaming = claude_request.get('stream', False)
+            logger.info(f"请求类型: {'流式' if is_streaming else '非流式'}")
+
+            # 根据是否流式选择端点
+            predict_method = "streamRawPredict" if is_streaming else "rawPredict"
+
             # global 区域使用不带前缀的域名
             if region == "global":
-                endpoint = f"https://aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{region}/publishers/anthropic/models/{vertex_model_name}:rawPredict"
+                endpoint = f"https://aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{region}/publishers/anthropic/models/{vertex_model_name}:{predict_method}"
             else:
-                endpoint = f"https://{region}-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{region}/publishers/anthropic/models/{vertex_model_name}:rawPredict"
+                endpoint = f"https://{region}-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{region}/publishers/anthropic/models/{vertex_model_name}:{predict_method}"
 
             headers = {
                 'Authorization': f'Bearer {access_token}',
                 'Content-Type': 'application/json'
             }
-
-            # 检查是否是流式请求
-            is_streaming = vertex_request.get('stream', False)
-            logger.info(f"请求类型: {'流式' if is_streaming else '非流式'}")
 
             if is_streaming:
                 # 流式请求处理
@@ -454,7 +474,7 @@ class GCPProxyServer:
                 # 记录精简格式的对话日志（仅请求部分，不包括响应）
                 self.log_simple_conversation(claude_request)
 
-                return self._handle_streaming_request(endpoint, headers, vertex_request)
+                return self._handle_streaming_request(endpoint, headers, vertex_request, claude_request)
             else:
                 # 非流式请求处理
                 logger.info("开始发送非流式请求到Vertex AI")
@@ -494,6 +514,12 @@ class GCPProxyServer:
                                 # 转换响应格式
                                 final_response = self.vertex_to_claude_response(vertex_response)
 
+                                # 打印 usage 到终端
+                                if 'usage' in final_response:
+                                    usage = final_response['usage']
+                                    input_total = usage.get('input_tokens', 0) + usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
+                                    logger.info(f"响应 Usage: input={input_total} (read={usage.get('cache_read_input_tokens',0)}, create={usage.get('cache_creation_input_tokens',0)}), output={usage.get('output_tokens', 0)}")
+
                                 # 记录最终返回给客户端的响应到日志文件
                                 api_logger.info("✅ 最终返回给客户端的响应:")
                                 api_logger.info(json.dumps(final_response, ensure_ascii=False, indent=2))
@@ -509,7 +535,7 @@ class GCPProxyServer:
                                 api_logger.info("=" * 80 + "\n")
                                 raise HTTPException(status_code=500, detail=f"响应解析错误: {str(e)}")
                         else:
-                            error_text = await response.atext() if hasattr(response, 'atext') else response.text
+                            error_text = response.text
                             logger.error(f"Vertex AI请求失败: {response.status_code}, {error_text}")
                             api_logger.info(f"❌ Vertex AI请求失败: {response.status_code}")
                             api_logger.info(f"错误详情: {error_text}")
@@ -530,7 +556,70 @@ class GCPProxyServer:
             logger.error(f"转发到Vertex AI失败: {type(e).__name__}: {e}")
             raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
 
-    async def _handle_streaming_request(self, endpoint: str, headers: Dict[str, str], vertex_request: Dict[str, Any]):
+    async def count_tokens(self, claude_request: Dict[str, Any]):
+        """转发 Token 计数请求到 Vertex AI"""
+        try:
+            # 获取访问令牌
+            access_token = self.get_access_token()
+
+            # 获取映射后的模型名
+            requested_model = claude_request.get('model', '')
+            vertex_model_name = self.get_vertex_model_name(requested_model)
+
+            # 构建 Vertex AI 请求
+            vertex_request = {
+                "model": vertex_model_name,
+                "messages": claude_request.get('messages', [])
+            }
+
+            # 处理 system 消息 (如果有)
+            if 'system' in claude_request:
+                vertex_request['system'] = claude_request['system']
+
+            # 处理 tools (如果有)
+            if 'tools' in claude_request:
+                vertex_request['tools'] = self._clean_tools(claude_request['tools'])
+
+            # Token 计数目前支持的区域有限，如果当前是 global，显式使用 us-central1
+            region = GCP_REGION
+            if region == "global":
+                # 切换到支持 count-tokens 的区域
+                count_region = "us-central1"
+                endpoint = f"https://{count_region}-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{count_region}/publishers/anthropic/models/count-tokens:rawPredict"
+            else:
+                endpoint = f"https://{region}-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{region}/publishers/anthropic/models/count-tokens:rawPredict"
+
+            logger.info(f"发送 Token 计数请求到端点: {endpoint} (模型: {vertex_model_name})")
+
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+
+            async with httpx.AsyncClient(verify=self.ssl_verify) as client:
+                response = await client.post(
+                    endpoint,
+                    json=vertex_request,
+                    headers=headers,
+                    timeout=30.0
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    logger.info(f"Token 计数成功: {result}")
+                    return result
+                else:
+                    error_text = response.text
+                    logger.error(f"Token 计数失败: {response.status_code}, {error_text}")
+                    raise HTTPException(status_code=response.status_code, detail=error_text)
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Token 计数转发失败: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def _handle_streaming_request(self, endpoint: str, headers: Dict[str, str], vertex_request: Dict[str, Any], claude_request: Dict[str, Any]):
         """处理流式请求 - 异步生成器"""
         try:
             logger.info("开始处理流式请求")
@@ -577,12 +666,21 @@ class GCPProxyServer:
                         current_event = None
                         pending_event_line = None
 
+                        # 用于聚合响应信息
+                        full_response_text = ""
+                        final_usage = {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation_input_tokens": 0
+                        }
+
                         async for line in response.aiter_lines():
                             line_str = line.strip() if line else ""
 
-                            if line_str.startswith('event: '):
+                            if line_str.startswith('event:'):
                                 # 处理事件行
-                                event_type = line_str[7:].strip()
+                                event_type = line_str[6:].strip()
                                 if event_type in ['message_start', 'content_block_start', 'content_block_delta',
                                                 'content_block_stop', 'message_delta', 'message_stop']:
                                     current_event = event_type
@@ -591,9 +689,9 @@ class GCPProxyServer:
                                     current_event = None
                                     pending_event_line = None
 
-                            elif line_str.startswith('data: '):
+                            elif line_str.startswith('data:'):
                                 # 处理数据行
-                                data_part = line_str[6:].strip()
+                                data_part = line_str[5:].strip()
 
                                 if data_part == '[DONE]':
                                     yield f"{line_str}\n\n"
@@ -611,12 +709,22 @@ class GCPProxyServer:
 
                                             yield f"{line_str}\n\n"
 
-                                            # 对于文本增量，添加调试信息
-                                            # if current_event == 'content_block_delta':
-                                            #    text = data_json.get('delta', {}).get('text', '')
-                                            #    # logger.info(f"🚀 实时发送文本: '{text}'")
-                                            #    # 确保立即刷新到客户端
-                                            #    await asyncio.sleep(0)
+                                            # 聚合信息用于日志记录
+                                            if current_event == 'message_start':
+                                                usage = data_json.get('message', {}).get('usage', {})
+                                                # message_start 包含初始的 usage 信息
+                                                for k in ['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']:
+                                                    if k in usage:
+                                                        final_usage[k] = usage[k]
+                                            elif current_event == 'content_block_delta':
+                                                delta = data_json.get('delta', {})
+                                                if delta.get('type') == 'text_delta':
+                                                    full_response_text += delta.get('text', '')
+                                            elif current_event == 'message_delta':
+                                                usage = data_json.get('usage', {})
+                                                # message_delta 包含该消息最终的 output_tokens 统计
+                                                if 'output_tokens' in usage:
+                                                    final_usage['output_tokens'] = usage['output_tokens']
 
                                     except json.JSONDecodeError:
                                         # 如果JSON解析失败，但事件类型正确，仍然发送
@@ -625,10 +733,27 @@ class GCPProxyServer:
                                             pending_event_line = None
                                         yield f"{line_str}\n\n"
 
-                            # 重置状态（空行或其他行）
-                            elif not line_str:
-                                current_event = None
-                                pending_event_line = None
+                        # 记录流式响应聚合结果
+                        api_logger.info("✅ 流式响应完成，聚合结果:")
+                        # 计算总输入 Token 用于日志展示
+                        input_tokens_total = (
+                            final_usage.get("input_tokens", 0) +
+                            final_usage.get("cache_read_input_tokens", 0) +
+                            final_usage.get("cache_creation_input_tokens", 0)
+                        )
+                        display_usage = final_usage.copy()
+                        display_usage["_total_input_tokens"] = input_tokens_total
+
+                        # 在终端打印 usage 信息
+                        logger.info(f"聚合 Usage: {json.dumps(display_usage)}")
+                        api_logger.info(f"Usage: {json.dumps(display_usage)}")
+
+                        # 记录到精简日志
+                        self.log_simple_conversation(claude_request, {
+                            "content": [{"type": "text", "text": full_response_text}],
+                            "usage": final_usage
+                        })
+
                     else:
                         # GCP可能返回的是JSON流或分块JSON
                         logger.info("处理JSON流响应")
@@ -686,6 +811,32 @@ async def proxy_messages(request: Request):
         logger.info(f"收到Claude API请求: {body.get('model', 'unknown')}, "
                    f"流式: {'是' if is_streaming else '否'}")
 
+        # 打印原始请求体结构（prompt字段截断显示）
+        print("\n" + "="*80)
+        print("【原始客户端请求体】")
+        print("="*80)
+        body_display = body.copy()
+
+        # 处理messages中的content字段，如果是prompt则截断
+        if 'messages' in body_display:
+            for msg in body_display['messages']:
+                if isinstance(msg.get('content'), str):
+                    content = msg['content']
+                    if len(content) > 100:
+                        msg['content'] = content[:100] + f"... [共 {len(content)} 字符]"
+
+        # 处理tools中的description字段，截断显示
+        if 'tools' in body_display:
+            for tool in body_display['tools']:
+                if 'description' in tool:
+                    desc = tool['description']
+                    if len(desc) > 100:
+                        tool['description'] = desc[:100] + f"... [共 {len(desc)} 字符]"
+
+        # 打印完整的结构化请求体
+        print(json.dumps(body_display, ensure_ascii=False, indent=2))
+        print("="*80 + "\n")
+
         # 转发到Vertex AI
         response = await proxy_server.forward_to_vertex(body)
 
@@ -713,6 +864,20 @@ async def proxy_messages(request: Request):
 
     except Exception as e:
         logger.error(f"代理请求失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/v1/messages/count_tokens")
+async def count_tokens(request: Request):
+    """代理 Claude Token 计数 API"""
+    try:
+        body = await request.json()
+        logger.info(f"收到 Token 计数请求: {body.get('model', 'unknown')}")
+
+        # 转发到 Vertex AI
+        result = await proxy_server.count_tokens(body)
+        return result
+    except Exception as e:
+        logger.error(f"Token 计数代理失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/models")
