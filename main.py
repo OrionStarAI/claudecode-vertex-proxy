@@ -641,6 +641,8 @@ class GCPProxyServer:
                         except:
                             error_detail = f"HTTP {response.status_code} 错误"
 
+                        logger.error(f"流式请求失败详情: {error_detail}")
+
                         api_logger.info(f"❌ Vertex AI请求失败: {response.status_code}")
                         api_logger.info(f"错误详情: {error_detail}")
                         api_logger.info("=" * 80 + "\n")
