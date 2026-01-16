@@ -46,6 +46,14 @@ simple_file_handler.setFormatter(logging.Formatter('%(message)s'))
 simple_logger.addHandler(simple_file_handler)
 simple_logger.propagate = False
 
+# 设置Vertex原始响应日志文件
+response_logger = logging.getLogger('response_logger')
+response_logger.setLevel(logging.INFO)
+response_file_handler = logging.FileHandler('api_response.log', encoding='utf-8')
+response_file_handler.setFormatter(logging.Formatter('%(asctime)s\n%(message)s\n'))
+response_logger.addHandler(response_file_handler)
+response_logger.propagate = False
+
 app = FastAPI(title="Claude to GCP Proxy", description="代理Claude API请求到GCP Vertex AI")
 
 # 添加 CORS 中间件，支持任何域名访问
@@ -511,6 +519,10 @@ class GCPProxyServer:
                                 api_logger.info("📤 Vertex AI原始响应:")
                                 api_logger.info(json.dumps(vertex_response, ensure_ascii=False, indent=2))
 
+                                # 记录Vertex原始响应到专用日志文件
+                                response_logger.info("=" * 80)
+                                response_logger.info(json.dumps(vertex_response, ensure_ascii=False, indent=2))
+
                                 # 转换响应格式
                                 final_response = self.vertex_to_claude_response(vertex_response)
 
@@ -677,8 +689,15 @@ class GCPProxyServer:
                             "cache_creation_input_tokens": 0
                         }
 
+                        response_logger.info("=" * 80)
                         async for line in response.aiter_lines():
                             line_str = line.strip() if line else ""
+
+                            # 🔍 打印 Vertex 原始响应行（用于调试 cache 数据）
+                            if line_str:
+                                logger.info(f"[Vertex原始] {line_str[:500]}")
+                                # 记录到专用响应日志文件
+                                response_logger.info(line_str)
 
                             if line_str.startswith('event:'):
                                 # 处理事件行
